@@ -1,31 +1,63 @@
 // =============================================================================
-// KurrentDBEventStore — KurrentDB-backed EventStore implementation
+// KurrentDBEventStore — KurrentDB Implementation of EventStore<TEvent>
+// =============================================================================
+// Durable event persistence backed by KurrentDB (formerly EventStoreDB).
+// Uses delegate-based serialization — the consumer provides serialize and
+// deserialize functions, keeping the store decoupled from any specific
+// serialization framework (System.Text.Json, MessagePack, Protobuf, etc.).
+//
+// Version mapping:
+//     Our StoredEvent.SequenceNumber is 1-based (first event = 1).
+//     KurrentDB StreamRevision is 0-based (first event = revision 0).
+//     Mapping: SequenceNumber = StreamRevision + 1
+//
+// Concurrency mapping:
+//     Our expectedVersion=0 (new stream)  → StreamState.NoStream
+//     Our expectedVersion=N (N events)    → StreamState.StreamRevision(N-1)
+//     KurrentDB WrongExpectedVersionException → our ConcurrencyException
 // =============================================================================
 
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 using KurrentDB.Client;
 
-using Picea.Glauca;
-
 namespace Picea.Glauca.KurrentDB;
 
 /// <summary>
-/// <see cref="EventStore{TEvent}"/> implementation backed by KurrentDB.
+/// KurrentDB-backed implementation of <see cref="EventStore{TEvent}"/>.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Uses delegate-based serialization to decouple the event store from
-/// any specific serialization library. The caller provides
-/// <c>serialize</c> and <c>deserialize</c> functions.
+/// Serialization is fully delegate-driven. The consumer provides two functions:
+/// <list type="bullet">
+///     <item><description>
+///         <c>serialize</c>: Converts a domain event to a tuple of (eventType, data).
+///         The <c>eventType</c> string is stored as the KurrentDB event type metadata
+///         and is used during deserialization to reconstruct the correct event type.
+///     </description></item>
+///     <item><description>
+///         <c>deserialize</c>: Reconstructs a domain event from the event type string
+///         and raw byte data.
+///     </description></item>
+/// </list>
 /// </para>
 /// <para>
-/// KurrentDB uses 0-based stream revisions internally. This adapter
-/// maps between Picea’s 1-based <see cref="StoredEvent{TEvent}.SequenceNumber"/>
-/// and KurrentDB’s 0-based <see cref="StreamRevision"/>.
+/// This design follows the <em>Strategy Pattern</em> (GoF) via delegates rather than
+/// interfaces — maximally flexible, no framework coupling. The consumer can use
+/// System.Text.Json with <c>[JsonDerivedType]</c>, MessagePack, Protobuf, or any
+/// custom binary format.
 /// </para>
+/// <example>
+/// <code>
+/// var store = new KurrentDBEventStore&lt;MyEvent&gt;(
+///     client,
+///     serialize: e =&gt; (e.GetType().Name, JsonSerializer.SerializeToUtf8Bytes(e, options)),
+///     deserialize: (type, data) =&gt; (MyEvent)JsonSerializer.Deserialize(data.Span, typeMap[type], options)!);
+/// </code>
+/// </example>
 /// </remarks>
-/// <typeparam name="TEvent">The event union type.</typeparam>
+/// <typeparam name="TEvent">The domain event type.</typeparam>
 public sealed class KurrentDBEventStore<TEvent> : EventStore<TEvent>
 {
     private readonly KurrentDBClient _client;
@@ -33,11 +65,16 @@ public sealed class KurrentDBEventStore<TEvent> : EventStore<TEvent>
     private readonly Func<string, ReadOnlyMemory<byte>, TEvent> _deserialize;
 
     /// <summary>
-    /// Creates a new KurrentDB event store.
+    /// Creates a new KurrentDB-backed event store.
     /// </summary>
-    /// <param name="client">The KurrentDB client.</param>
-    /// <param name="serialize">Serializes an event to (eventType, data).</param>
-    /// <param name="deserialize">Deserializes (eventType, data) back to an event.</param>
+    /// <param name="client">The KurrentDB client instance.</param>
+    /// <param name="serialize">
+    /// Converts a domain event to its wire format: an event type string
+    /// (used for deserialization dispatch) and the serialized byte payload.
+    /// </param>
+    /// <param name="deserialize">
+    /// Reconstructs a domain event from the event type string and byte payload.
+    /// </param>
     public KurrentDBEventStore(
         KurrentDBClient client,
         Func<TEvent, (string EventType, ReadOnlyMemory<byte> Data)> serialize,
@@ -48,119 +85,169 @@ public sealed class KurrentDBEventStore<TEvent> : EventStore<TEvent>
         _deserialize = deserialize ?? throw new ArgumentNullException(nameof(deserialize));
     }
 
-    /// <inheritdoc />
+    /// <inheritdoc/>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<IReadOnlyList<StoredEvent<TEvent>>> AppendAsync(
-        string streamId, TEvent[] events, long expectedVersion,
+        string streamId,
+        TEvent[] events,
+        long expectedVersion,
         CancellationToken ct = default)
     {
-        if (events.Length == 0)
-            return Array.Empty<StoredEvent<TEvent>>();
+        using var activity = EventSourcingDiagnostics.Source.StartActivity("KurrentDB.Append");
+        activity?.SetTag("es.stream.id", streamId);
+        activity?.SetTag("es.event.count", events.Length);
+        activity?.SetTag("es.expected_version", expectedVersion);
 
-        var eventData = events.Select(e =>
+        if (events.Length == 0)
         {
-            var (eventType, data) = _serialize(e);
-            return new EventData(Uuid.NewUuid(), eventType, data);
-        }).ToArray();
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            return Array.Empty<StoredEvent<TEvent>>();
+        }
+
+        // Map our 1-based expectedVersion to KurrentDB's StreamState:
+        //   expectedVersion=0 (new stream) → StreamState.NoStream
+        //   expectedVersion=N              → StreamState.StreamRevision(N-1)  (0-based)
+        var streamState = expectedVersion == 0
+            ? StreamState.NoStream
+            : StreamState.StreamRevision((ulong)(expectedVersion - 1));
+
+        var eventDataList = new EventData[events.Length];
+        for (var i = 0; i < events.Length; i++)
+        {
+            var (eventType, data) = _serialize(events[i]);
+            eventDataList[i] = new EventData(Uuid.NewUuid(), eventType, data);
+        }
 
         try
         {
-            // Map 1-based expectedVersion to KurrentDB's StreamState/StreamRevision
-            var writeResult = expectedVersion == 0
-                ? await _client.AppendToStreamAsync(
-                    streamId, StreamState.NoStream, eventData, cancellationToken: ct)
-                : await _client.AppendToStreamAsync(
-                    streamId, new StreamRevision((ulong)(expectedVersion - 1)),
-                    eventData, cancellationToken: ct);
-
-            // Build stored events with correct sequence numbers
-            var stored = new List<StoredEvent<TEvent>>(events.Length);
-            var now = DateTimeOffset.UtcNow;
-
-            for (var i = 0; i < events.Length; i++)
-            {
-                stored.Add(new StoredEvent<TEvent>(
-                    expectedVersion + i + 1,
-                    events[i],
-                    now));
-            }
-
-            return stored;
+            await _client.AppendToStreamAsync(
+                streamId,
+                streamState,
+                eventDataList,
+                cancellationToken: ct).ConfigureAwait(false);
         }
-        catch (WrongExpectedVersionException)
+        catch (WrongExpectedVersionException ex)
         {
-            // Load current stream to get actual version
-            var current = await LoadAsync(streamId, ct);
-            var actualVersion = current.Count > 0
-                ? current[^1].SequenceNumber
+            activity?.SetStatus(ActivityStatusCode.Error, "Concurrency conflict");
+
+            // Map KurrentDB's actual version (StreamState, 0-based) to our 1-based version.
+            // ActualVersion is a nullable long. When the stream doesn't exist, KurrentDB
+            // reports StreamState.NoStream which maps to -1 via ToInt64().
+            // KurrentDB 0-based revision N → our version N+1.
+            // Null or negative (NoStream = -1) → 0 (no events).
+            var actualVersion = ex.ActualVersion is >= 0
+                ? ex.ActualVersion.Value + 1
                 : 0;
+
             throw new ConcurrencyException(streamId, expectedVersion, actualVersion);
         }
+
+        // Build StoredEvent results with 1-based sequence numbers.
+        // After a successful append, the first new event's sequence number is
+        // expectedVersion + 1 (since expectedVersion = number of events before append).
+        var timestamp = DateTimeOffset.UtcNow;
+        var stored = new StoredEvent<TEvent>[events.Length];
+        for (var i = 0; i < events.Length; i++)
+        {
+            stored[i] = new StoredEvent<TEvent>(
+                expectedVersion + i + 1,
+                events[i],
+                timestamp);
+        }
+
+        activity?.SetTag("es.new_version", expectedVersion + events.Length);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+
+        return stored;
     }
 
-    /// <inheritdoc />
+    /// <inheritdoc/>
     [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
     public async ValueTask<IReadOnlyList<StoredEvent<TEvent>>> LoadAsync(
-        string streamId, CancellationToken ct = default)
-    {
-        try
-        {
-            var result = _client.ReadStreamAsync(streamId, Direction.Forwards,
-                StreamPosition.Start, cancellationToken: ct);
-
-            var events = new List<StoredEvent<TEvent>>();
-            long seq = 1;
-
-            await foreach (var resolved in result)
-            {
-                var @event = _deserialize(
-                    resolved.Event.EventType,
-                    resolved.Event.Data);
-
-                events.Add(new StoredEvent<TEvent>(
-                    seq++, @event, resolved.Event.Created));
-            }
-
-            return events;
-        }
-        catch (StreamNotFoundException)
-        {
-            return Array.Empty<StoredEvent<TEvent>>();
-        }
-    }
-
-    /// <inheritdoc />
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
-    public async ValueTask<IReadOnlyList<StoredEvent<TEvent>>> LoadAsync(
-        string streamId, long afterVersion,
+        string streamId,
         CancellationToken ct = default)
     {
-        try
+        using var activity = EventSourcingDiagnostics.Source.StartActivity("KurrentDB.Load");
+        activity?.SetTag("es.stream.id", streamId);
+
+        var result = _client.ReadStreamAsync(
+            Direction.Forwards,
+            streamId,
+            StreamPosition.Start,
+            cancellationToken: ct);
+
+        // StreamNotFound → return empty (matches InMemoryEventStore behavior)
+        if (await result.ReadState.ConfigureAwait(false) == ReadState.StreamNotFound)
         {
-            // afterVersion is 1-based, KurrentDB StreamPosition is 0-based
-            var startPosition = new StreamPosition((ulong)afterVersion);
-
-            var result = _client.ReadStreamAsync(streamId, Direction.Forwards,
-                startPosition, cancellationToken: ct);
-
-            var events = new List<StoredEvent<TEvent>>();
-            long seq = afterVersion + 1;
-
-            await foreach (var resolved in result)
-            {
-                var @event = _deserialize(
-                    resolved.Event.EventType,
-                    resolved.Event.Data);
-
-                events.Add(new StoredEvent<TEvent>(
-                    seq++, @event, resolved.Event.Created));
-            }
-
-            return events;
-        }
-        catch (StreamNotFoundException)
-        {
+            activity?.SetTag("es.event.count", 0);
+            activity?.SetStatus(ActivityStatusCode.Ok);
             return Array.Empty<StoredEvent<TEvent>>();
         }
+
+        var stored = new List<StoredEvent<TEvent>>();
+        await foreach (var resolved in result.ConfigureAwait(false))
+        {
+            var @event = _deserialize(
+                resolved.Event.EventType,
+                resolved.Event.Data);
+
+            // Map 0-based StreamRevision to 1-based SequenceNumber
+            stored.Add(new StoredEvent<TEvent>(
+                (long)resolved.Event.EventNumber.ToUInt64() + 1,
+                @event,
+                resolved.Event.Created));
+        }
+
+        activity?.SetTag("es.event.count", stored.Count);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+
+        return stored;
+    }
+
+    /// <inheritdoc/>
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
+    public async ValueTask<IReadOnlyList<StoredEvent<TEvent>>> LoadAsync(
+        string streamId,
+        long afterVersion,
+        CancellationToken ct = default)
+    {
+        using var activity = EventSourcingDiagnostics.Source.StartActivity("KurrentDB.LoadAfter");
+        activity?.SetTag("es.stream.id", streamId);
+        activity?.SetTag("es.after_version", afterVersion);
+
+        // afterVersion is 1-based. The event at afterVersion has 0-based revision
+        // (afterVersion - 1). We want events AFTER that, so start at revision afterVersion.
+        var startRevision = StreamPosition.FromInt64(afterVersion);
+
+        var result = _client.ReadStreamAsync(
+            Direction.Forwards,
+            streamId,
+            startRevision,
+            cancellationToken: ct);
+
+        if (await result.ReadState.ConfigureAwait(false) == ReadState.StreamNotFound)
+        {
+            activity?.SetTag("es.event.count", 0);
+            activity?.SetStatus(ActivityStatusCode.Ok);
+            return Array.Empty<StoredEvent<TEvent>>();
+        }
+
+        var stored = new List<StoredEvent<TEvent>>();
+        await foreach (var resolved in result.ConfigureAwait(false))
+        {
+            var @event = _deserialize(
+                resolved.Event.EventType,
+                resolved.Event.Data);
+
+            stored.Add(new StoredEvent<TEvent>(
+                (long)resolved.Event.EventNumber.ToUInt64() + 1,
+                @event,
+                resolved.Event.Created));
+        }
+
+        activity?.SetTag("es.event.count", stored.Count);
+        activity?.SetStatus(ActivityStatusCode.Ok);
+
+        return stored;
     }
 }
