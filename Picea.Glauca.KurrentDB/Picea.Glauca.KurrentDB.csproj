@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata -->
+  <PropertyGroup>
+    <PackageId>Picea.Glauca.KurrentDB</PackageId>
+    <Title>Picea.Glauca.KurrentDB</Title>
+    <Description>KurrentDB (formerly EventStoreDB) adapter for Picea.Glauca EventStore abstraction. Provides a production-ready event store implementation with delegate-based serialization, optimistic concurrency, and full EventStore&lt;TEvent&gt; contract compliance.</Description>
+    <Authors>Maurice Peters</Authors>
+    <PackageTags>event-sourcing;kurrentdb;eventstoredb;event-store;adapter;picea;glauca</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Picea/Glauca</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Picea/Glauca</PackageProjectUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Picea.Glauca\Picea.Glauca.csproj" />
+    <PackageReference Include="KurrentDB.Client" Version="1.3.0" />
+  </ItemGroup>
+
+</Project>

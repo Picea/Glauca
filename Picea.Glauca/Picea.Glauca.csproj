@@ -1,0 +1,36 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- NuGet package metadata -->
+  <PropertyGroup>
+    <PackageId>Picea.Glauca</PackageId>
+    <Title>Picea.Glauca</Title>
+    <Description>Event Sourcing patterns modeled as Mealy machine automata — Aggregate runners with optimistic concurrency, conflict resolution, Saga orchestration, Projections, and pluggable EventStore abstraction. Built on the Picea kernel with Result-based error handling and OpenTelemetry instrumentation.</Description>
+    <Authors>Maurice Peters</Authors>
+    <PackageTags>event-sourcing;cqrs;aggregate;saga;projection;event-store;automaton;state-machine;ddd;domain-driven-design;functional;picea</PackageTags>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <RepositoryUrl>https://github.com/Picea/Glauca</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageProjectUrl>https://github.com/Picea/Glauca</PackageProjectUrl>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Picea" Version="1.0.*-*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Picea.Glauca.KurrentDB" />
+    <InternalsVisibleTo Include="Picea.Glauca.KurrentDB.Tests" />
+    <InternalsVisibleTo Include="Picea.Glauca.Tests" />
+  </ItemGroup>
+
+</Project>
