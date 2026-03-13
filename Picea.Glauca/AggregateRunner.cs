@@ -41,7 +41,6 @@ public sealed class AggregateRunner<TDecider, TState, TCommand, TEvent, TEffect,
     private TState _state;
     private long _version;
     private readonly List<TEffect> _effects = [];
-    private bool _isTerminal;
 
     private AggregateRunner(EventStore<TEvent> store, string streamId,
         TState state, long version, TParameters parameters)
@@ -69,7 +68,7 @@ public sealed class AggregateRunner<TDecider, TState, TCommand, TEvent, TEffect,
     public IReadOnlyList<TEffect> Effects => _effects;
 
     /// <summary>Whether the aggregate has reached a terminal state.</summary>
-    public bool IsTerminal => _isTerminal;
+    public bool IsTerminal => TDecider.IsTerminal(_state);
 
     /// <summary>
     /// Creates a new aggregate runner with initial state (no events loaded).
