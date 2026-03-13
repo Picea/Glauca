@@ -22,7 +22,9 @@ jobs:
           dotnet-quality: 'preview'
 
       - name: Install GitVersioning
-        run: dotnet tool install --global nbgv
+        run: |
+          dotnet tool install --global nbgv
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
 
       - name: Set version
         id: version
