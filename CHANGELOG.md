@@ -22,6 +22,7 @@ via [Nerdbank.GitVersioning](https://github.com/dotnet/Nerdbank.GitVersioning).
 ### Changed
 
 - **README.md**: Comprehensive rewrite with installation, quick start, projections, conflict resolution, sagas, KurrentDB adapter, OpenTelemetry, API reference, and ecosystem table
+- **Picea dependency**: Upgraded from floating pre-release version constraint (`1.0.*-*`) to the official stable release `1.0.0`
 
 ## [0.1.13] — 2026-03-13
 
