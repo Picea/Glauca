@@ -24,7 +24,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Picea" Version="1.0.*-*" />
+    <PackageReference Include="Picea" Version="1.0.0" />
   </ItemGroup>
 
   <ItemGroup>
